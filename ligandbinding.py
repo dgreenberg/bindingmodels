@@ -1,33 +1,6 @@
 import numpy as np
 from collections import namedtuple
 
-def roots_scaled(p):
-    #this function finds roots, while trying to deal with numerical instability
-    #due to vastly differing polynomial coefficeints
-    #
-    #many computations are done in the log domain
-    #
-    #to improve numerical stability, it first scales the input to the polynomial by
-    #y = sx so that p(x) = Aq(y)
-    #and the coefficients of q are all roughly +/- 1
-        
-    n = p.size - 1; #polynomial order
-    
-    if n < 2:
-        return np.roots(p)
-    
-    h = np.log(np.abs(p));
-    
-    #calculate logarithms of s and A via linear regression
-    M = np.concatenate((np.array(range(0, n + 1)).reshape(n + 1, 1), np.ones((n + 1, 1))), axis = 1) #1st column range from 0 to n, 2nd column is all 1.0
-    logsA = np.linalg.lstsq(M, h.reshape(n + 1, 1))[0].reshape(-1) #fixme use weighted linear regression instead
-        
-    g = h - (logsA[0] * np.array(range(0, n + 1)) + logsA[1]) #g_i = +/- log(q_i)
-    
-    q = np.exp(g) * np.sign(p)
-        
-    return np.roots(q) / np.exp(logsA[0])
-
 def EqstatesFromFreeLigand(Lfree, Ka):
     #get binding state ratios as a function of free ligand concentration
     #Lfree and Ka can both be vectors
@@ -51,24 +24,18 @@ def EqstatesFromFreeLigand(Lfree, Ka):
         c[i, :] = rc[i, :] / s[i]
     
     return c
-    
-def FreeLigandFromTotals(Ltotal, Mtot, Ka):
-    #calculates free ligand concentration from total ligand and macromolecule concentrations, and Ka's
-    #this requires solving a polynomial of order nstates
-    #Ltot and Ka can both be vectors
-    #Mtot must be a scalar
-    
-    #convert scalars to numpy arrays as needed, and calculate running product of Ka's
-    Ltot = np.array(Ltotal).reshape(-1)    
+
+def sequential_binding_polynomial(Ltot, Mtot, Ka):
     Kaprod = np.cumprod(np.array(Ka).reshape(-1)) #product coefficients for the Adair-Klotz equation
     
-    nstates = Kaprod.size + 1
-    nconcentrations = Ltot.size
+    nstates = Ka.size + 1
+    nconcentrations = Ltot.size    
     
     P = np.zeros((nconcentrations, nstates + 1)) #polynomial coefficients.
     #highest term is of order nstates, so we have nstates + 1 coefficients.
-    #for example, if we can bind up to 4 ligands per macromolecule we have 5 states and a 6-th order polynomial
-    #each row goes left-to-right from lower to higher order (starting with constant term)    
+    #For example, if we can bind up to 4 ligands per macromolecule we have 5 states
+    #and a 5-th order polynomial with 6 coefficients.
+    #each row goes left-to-right from lower to higher order (starting with constant term)
         
     #we need to solve the equation Z * Ltot = Z * L + Mtot * \sum_{i=1}^{nstates-1} i * L^i * Kaprod[i-1]
     #for the variable L
@@ -76,16 +43,30 @@ def FreeLigandFromTotals(Ltotal, Mtot, Ka):
     #Z = 1 + \sum_{i=1}^{nstates-1} L^i Kaprod[i - 1]    
     P[:, 1:]   += np.append(1.0, Kaprod)                              #Z * L
     P[:, 0:-1] -= Ltot.reshape(nconcentrations, 1) * np.append(1.0, Kaprod) #Z * Ltot. this is an outer product
-    P[:, 1:-1] += Mtot * Kaprod * np.array(range(1, nstates))         #Mtot * \sum_{i=1}^{nstates-1} i * L^i * Kaprod[i-1]
+    P[:, 1:-1] += Mtot.reshape(nconcentrations, 1) * Kaprod * np.array(range(1, nstates))         #Mtot * \sum_{i=1}^{nstates-1} i * L^i * Kaprod[i-1]
+    
+    return P
+
+def FreeLigandFromTotals(Ltot, Mtot, Ka):
+    #calculates free ligand concentration from total ligand and macromolecule concentrations, and Ka's
+    #this requires solving a polynomial of order nstates
+    #Ka is a vector of association constants for sequential binding
+    #Mtot and Ltot can be either scalars or vectors
+    
+    LT = Ltot.reshape(-1)
+    MT = Mtot.reshape(-1)    
+    
+    nconcentrations = Ltot.size    
+    P = sequential_binding_polynomial(LT, MT, Ka)
     
     Lfree = np.zeros(nconcentrations) #free ligand for each concentration of total ligand
     
     for i in range(0, nconcentrations):
-        if Ltot[i] == 0:
+        if LT[i] == 0:
             Lfree[i] = 0
         else:
             rts = np.roots(P[i, ::-1]) #note that we reverse the polynomial coefficients to get the order highest to lowest before calling roots()
-            ok = np.flatnonzero((np.isreal(rts)) & (rts >= 0) & (rts <= Ltot[i]))
+            ok = np.flatnonzero((np.isreal(rts)) & (rts >= 0) & (rts <= LT[i]))
             assert ok.size == 1, "failed to find valid unique solution for Lfree"
             Lfree[i] = rts[ok[0]].real #explictly take real part to avoid warning; we know the complex is zero from the above.
     
@@ -128,7 +109,7 @@ def SimulateITC(Ka, dHstates, V0, M0, Lfree0, Linjection, Vinjection, ninjection
         #calculate the binding state fractions from the free ligand concentration
         c[i,:] = EqstatesFromFreeLigand(Lfree[i], Ka)
     
-    #determine evolved heat for each step of the protocol:
+    #determine total evolved heat up to and including each step of the protocol:
     for i in range(0, ninjections + 1): #for each injection and for initial state
         dH[i] = EnthalpyDifference(c[i,:], dHstates, Mmoles[i])
     
